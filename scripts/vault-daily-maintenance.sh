@@ -113,7 +113,7 @@ fi
 # a good place to spend a few minutes of disk churn right now. Two cases where
 # it is not, both invisible to loadavg:
 #   * ON BATTERY AND LOW - a GC pass is never worth someone's LAST charge.
-#     Deferring on battery *at any level* is what this used to do, and it is a
+#     Deferring ON BATTERY *at any level* is what this used to do, and it is a
 #     trap for anyone who works unplugged: "tomorrow, or the next time they plug
 #     in" never arrives, the pass silently stops running for weeks, and each log
 #     line still promises that the next run will catch up. Threshold instead:
