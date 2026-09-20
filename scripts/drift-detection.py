@@ -289,11 +289,20 @@ def main():
     today = datetime.now().strftime("%Y-%m-%d")
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
+    # The purpose line carries both ": " and "'". An unquoted YAML scalar
+    # containing ": " parses as a nested mapping, so the generated file's
+    # frontmatter failed yaml.safe_load. json.dumps emits a double-quoted
+    # scalar, which is valid YAML and survives any --include value.
+    purpose = (
+        f"Multi-edit drift audit. Files edited {args.min_edits}+ times "
+        f"in last {args.days} days. Include: '{args.include}'."
+    )
+
     body = [
         "---",
         f"creationDate: {today}",
         "type: meta",
-        f"purpose: Multi-edit drift audit. Files edited {args.min_edits}+ times in last {args.days} days. Include: '{args.include}'.",
+        f"purpose: {json.dumps(purpose)}",
         "generator: scripts/drift-detection.py",
         "---",
         "",
