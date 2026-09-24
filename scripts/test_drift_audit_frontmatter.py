@@ -76,6 +76,8 @@ def run_script(vault: Path, include: str) -> subprocess.CompletedProcess:
         env=env,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
 
 

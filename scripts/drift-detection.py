@@ -236,6 +236,8 @@ def git(args):
         cwd=str(VAULT_ROOT),
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=False,
     )
     return r.stdout
