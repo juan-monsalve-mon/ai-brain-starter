@@ -9,6 +9,18 @@ description: What's new in AI Brain Starter — plain English, no jargon
 
 ---
 
+## 2026-09-20: the generated Drift Audit frontmatter did not parse as YAML, and the script could silently audit the wrong vault
+
+**Who this affects:** anyone running `drift-detection.py`, and anyone with `VAULT_ROOT` exported machine-wide (Claude Code's `settings.json` `env` block does this by default) who runs it from a vault other than the one `VAULT_ROOT` names.
+
+**Bug 1 — the frontmatter it wrote couldn't be parsed.** The generated `Meta/Drift Audit.md` carries a `purpose:` line built from the `--include` glob, e.g. `purpose: Multi-edit drift audit. ... Include: '*.md'.`. An unquoted YAML scalar containing `": "` is read as a nested mapping, so `yaml.safe_load` raised "mapping values are not allowed here" — the file was invisible to Dataview, metadata extractors, and any other frontmatter-reading tool, with nothing erroring to say so. The purpose line is now JSON-encoded (`json.dumps`), which is valid YAML and survives any `--include` value, including one with an apostrophe in it.
+
+**Bug 2 — a globally-exported `VAULT_ROOT` silently outranked the vault you were standing in.** The script read `os.environ.get("VAULT_ROOT") or os.getcwd()`: once `VAULT_ROOT` is set anywhere (a shell profile, or Claude Code's `env` block, which every hook subprocess inherits), it always wins, even when you `cd` into a different git-tracked vault and run the script there. Both the git history it scans and the `Meta/Drift Audit.md` it writes would resolve against the wrong vault, with no error. It now prefers the current directory, and only falls back to `VAULT_ROOT` when the current directory isn't a git repo, when the two already agree, or when you set `VAULT_ROOT_FORCE=1` — otherwise it warns and audits the directory you actually ran it from.
+
+Bug 2 surfaced while landing the fix for Bug 1, not from a user report — both ship together, with a regression test for each.
+
+---
+
 ## 2026-09-17: graphify's self-link guard missed accented filenames, and skipped files were invisible
 
 **Who this affects:** anyone running `graphify_apply_wikilinks.py` on a vault with accented filenames, notes that share a name across folders, or notes near the 1 MB read cap.
