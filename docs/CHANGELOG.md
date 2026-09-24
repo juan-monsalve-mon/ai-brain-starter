@@ -9,6 +9,16 @@ description: What's new in AI Brain Starter — plain English, no jargon
 
 ---
 
+## 2026-09-24: graph routing never fired on Linux
+
+**Who this affects:** anyone running `graph-context-hook.sh` on Linux, or anywhere `stat` is the GNU version, with a graph that exists.
+
+The hook reads the graph file's age to warn when it is stale. It asked `stat -f %m` first, which is the macOS form. On Linux `stat -f` means "file system", so it printed text and still reported success, and the hook then crashed on that text and printed nothing. Routing silently never happened there.
+
+Now it asks the Linux form first, then the macOS form, checks that the answer is a number, and says "age unknown" instead of crashing if neither works. The test added with the graph-routing env overrides (#682) caught this the first time it ran on a Linux machine.
+
+---
+
 ## 2026-09-23: the Decision Log index stops listing decisions as "????-??-?? — What"
 
 **Who this affects:** anyone whose decision files have `creationDate` but no `decision_date`, or use a What/Why template with `## What` (or `## Qué`) as the first heading. Session-close writes plenty of both.
@@ -30,6 +40,30 @@ Now, when `decision_date` is missing, the date comes from `creationDate`, and fa
 **Bug 2 — a globally-exported `VAULT_ROOT` silently outranked the vault you were standing in.** The script read `os.environ.get("VAULT_ROOT") or os.getcwd()`: once `VAULT_ROOT` is set anywhere (a shell profile, or Claude Code's `env` block, which every hook subprocess inherits), it always wins, even when you `cd` into a different git-tracked vault and run the script there. Both the git history it scans and the `Meta/Drift Audit.md` it writes would resolve against the wrong vault, with no error. It now prefers the vault you're actually standing in — cwd, or an ancestor of cwd that already has a Meta folder, collapsing a vault worktree to its main vault first — and only falls back to `VAULT_ROOT` when cwd isn't inside an established vault at all (a plain code checkout, say), when the two already agree, or when you set `VAULT_ROOT_FORCE=1` — otherwise it warns and audits the vault you actually ran it from. `compress-vault-doc.py` resolves the vault the same way, so it can always find what `drift-detection.py` just wrote.
 
 Bug 2 surfaced while landing the fix for Bug 1, not from a user report — both ship together, with a regression test for each. Both bugs, and this second hardening pass on Bug 2's own fix (the worktree and non-vault-checkout cases), came from @juan-monsalve-mon's #683 plus an independent adversarial review of that PR before it landed.
+
+---
+
+## 2026-09-19: the graph routing hook told you to customize it, then overwrote your customization
+
+**Who this affects:** anyone who set up `graph-context-hook.sh` and has only ONE graph — the default second graph points at `$VAULT_ROOT/Work/`, a folder most vaults do not have.
+
+The hook's own header says "CUSTOMIZE THIS SCRIPT for your vault" and lists four values to edit. But `install-hooks-user-level.py` treats it as a vault-content hook and copies it from the skill into the vault **unconditionally**, and the auto-update runs that roughly every six days. So the file asks you to edit it and then silently discards what you wrote.
+
+**What that looked like on one vault:** the local edit emptied `SECONDARY_GRAPH`, which is the documented way to say "I only have one graph" — the code already guards on it being empty. After an installer run the default came back, and every prompt containing *work*, *team*, *client*, *meeting*, *deadline* or *sprint* was injected with:
+
+> ⚠ LOST — this graph was built before but is GONE now ... rebuild it: /graphify --update on Work/
+
+A false alarm about a graph that never existed, plus an instruction to rebuild it, on every prompt of that family. The user had already moved the file out of the installer's reach once; the installer simply repointed `settings.json` back at the copy it manages, and the edited file sat there unused.
+
+**The fix:** every CONFIG value now reads an env override, so it can live in `~/.claude/settings.json` → `env`, which the installer does not touch — exactly how `VAULT_ROOT` already worked. One graph only:
+
+```json
+"env": { "SECONDARY_GRAPH": "" }
+```
+
+Note for anyone reading the diff: `SECONDARY_GRAPH` uses `${VAR-default}`, not `${VAR:-default}`. The bare `-` is the only spelling that honours an exported empty value; with `:-` the default would come back and re-enable the graph the user just turned off. The other values keep `:-` because emptying them is not a supported configuration.
+
+Nothing changes if you set no env vars: same defaults, same behaviour.
 
 ---
 
