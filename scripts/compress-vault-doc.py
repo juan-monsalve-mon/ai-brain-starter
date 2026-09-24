@@ -61,50 +61,27 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 # checkout or a synced vault copy (see sync-vault-scripts.sh's VAULT_LIB_MODULES).
 sys.path.insert(0, str(_SCRIPT_DIR))
 sys.path.insert(0, str(_SCRIPT_DIR.parent / "hooks"))
-from _lib.vault_root import collapse_worktree, find_meta_vault_root, vault_root_for  # noqa: E402
+from _lib.vault_root import collapse_worktree, resolve_cli_vault_root  # noqa: E402
 
-
-def _resolve_vault_root() -> Path:
-    """Resolve the vault root with the SAME precedence as
-    scripts/drift-detection.py's _resolve_vault_root() (#683 F3): cwd, when
-    it resolves to an already-established vault (an ancestor with a
-    Meta-suffixed folder, worktree-collapsed); VAULT_ROOT as a guarded
-    fallback otherwise, honoring VAULT_ROOT_FORCE=1 on a genuine mismatch.
-
-    This script is the CONSUMER of what drift-detection.py's `--auto-from-
-    drift` PRODUCES (`Meta/Drift Audit.md`). Before this fix each script read
-    VAULT_ROOT independently -- this one naively -- so a cwd/VAULT_ROOT
-    combination that drift-detection.py resolved to one vault could have this
-    script looking for its output in another, reporting a false "Drift Audit
-    not found" with no hint that the producer wrote the file somewhere else.
-    Sharing the precedence (not just the env var) is what makes them agree.
-
-    Falls back to this script's own pre-existing default (its parent
-    directory) only when NEITHER cwd nor VAULT_ROOT resolves to an
-    established vault at all -- the one case where there is no vault for the
-    two scripts to agree on, and the case this script's default already
-    covered before #683.
-    """
-    cwd = Path.cwd()
-    cwd_vault = find_meta_vault_root(collapse_worktree(cwd))
-    env_raw = os.environ.get("VAULT_ROOT")
-
-    if cwd_vault is None:
-        found = vault_root_for(cwd)
-        return found if found is not None else collapse_worktree(_SCRIPT_DIR.parent)
-
-    if not env_raw:
-        return cwd_vault
-
-    env_root = collapse_worktree(Path(os.path.expanduser(env_raw)).resolve())
-    if env_root == cwd_vault:
-        return cwd_vault
-    if os.environ.get("VAULT_ROOT_FORCE", "").strip().lower() in ("1", "true", "yes"):
-        return env_root
-    return cwd_vault
-
-
-VAULT_ROOT = _resolve_vault_root()
+# This script is the CONSUMER of what drift-detection.py's `--auto-from-
+# drift` PRODUCES (`Meta/Drift Audit.md`). Before #683's review, each script
+# carried its OWN copy of resolve_cli_vault_root's precedence -- this one
+# read VAULT_ROOT naively -- so a cwd/VAULT_ROOT combination
+# drift-detection.py resolved one way could have this script looking for its
+# output somewhere else, reporting a false "Drift Audit not found" with no
+# hint the producer wrote the file elsewhere. Calling the SAME function
+# drift-detection.py calls (hooks/_lib/vault_root.py's resolve_cli_vault_root)
+# is what makes them agree by construction, not by two copies staying in
+# sync by hand.
+#
+# fallback= is this script's own pre-existing default (its parent
+# directory), used only when NEITHER cwd nor VAULT_ROOT resolves to an
+# established vault at all -- the one case where there is no vault for the
+# two scripts to agree on, and the case this script's default already
+# covered before #683. No on_mismatch=: this script has no warning of its
+# own to raise on a mismatch (unlike drift-detection.py), so it takes the
+# function's default silent resolution.
+VAULT_ROOT = resolve_cli_vault_root(fallback=collapse_worktree(_SCRIPT_DIR.parent))
 
 
 # ─── Regex patterns (run in order) ──────────────────────────────────────

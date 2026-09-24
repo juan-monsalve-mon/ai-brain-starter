@@ -59,70 +59,24 @@ from pathlib import Path
 # scripts/drift-detection.py, sitting next to hooks/_lib/ two levels up.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
-from _lib.vault_root import collapse_worktree, find_meta_vault_root, vault_root_for  # noqa: E402
+from _lib.vault_root import collapse_worktree, resolve_cli_vault_root  # noqa: E402
 
 
-def _resolve_vault_root() -> Path:
-    """Resolve the vault root: the vault cwd is actually inside, VAULT_ROOT
-    as a guarded fallback.
+def _warn_vault_root_mismatch(cwd_vault: Path, env_root: Path) -> None:
+    """resolve_cli_vault_root's on_mismatch callback for this CLI.
 
-    This CLI is documented (see the module docstring) to default to the
-    current working directory -- it is meant to be run from inside the vault
-    you want audited, the same way you would run a linter from a project
-    root. A naive `os.environ.get("VAULT_ROOT") or os.getcwd()` gets that
-    backwards: VAULT_ROOT is routinely exported machine-wide (a shell
+    This CLI is documented (see the module docstring) to prefer the vault
+    you actually ran it from over a globally-exported VAULT_ROOT (a shell
     profile, or a Claude Code settings.json `env` block, so every hook
-    subprocess always sees it set), which means it ALWAYS wins once set,
-    silently overriding the vault the caller actually cd-ed into and meant
-    to audit -- `git()` below runs with cwd=VAULT_ROOT, and the report is
-    written under VAULT_ROOT too, so the mismatch is not a cosmetic label,
-    it audits and overwrites the wrong vault's `Meta/Drift Audit.md` with no
-    error (scripts/check-vault-root-reads.py's SEV-B-cwd bug class: right
-    often enough to look fine, wrong whenever the tool runs from anywhere
-    else).
-
-    A first pass at this fix (#683) treated "cwd is SOME git repo" as "cwd is
-    a vault", which got two cases backwards: cwd inside a plain code
-    checkout (no Meta folder at all) still beat a real VAULT_ROOT and wrote
-    into <coderepo>/Meta, and cwd inside a vault's OWN `.claude/worktrees/`
-    checkout was treated as a second, separate vault instead of collapsing
-    to the main one. "Cwd is a vault" now means what
-    hooks/_lib/vault_root.py's find_meta_vault_root() means: an ancestor of
-    cwd (worktree-collapsed) already has a Meta-suffixed folder -- not
-    merely that cwd happens to sit inside some git repository.
-
-    Precedence:
-      1. cwd (worktree-collapsed), when it resolves to an already-established
-         vault (an ancestor with a Meta-suffixed folder) and VAULT_ROOT is
-         unset, or set but equal to that vault.
-      2. VAULT_ROOT (worktree-collapsed), when cwd does NOT resolve to an
-         established vault at all -- there is nothing here to override --
-         or when VAULT_ROOT_FORCE=1 (deliberate cross-vault run).
-      3. Otherwise the vault cwd resolves to wins, with a warning naming the
-         ignored VAULT_ROOT -- the actual bug-class fix: a real mismatch no
-         longer resolves silently to the wrong vault.
-      4. cwd itself (worktree-collapsed), when NEITHER cwd nor VAULT_ROOT
-         resolves to an established vault (new-install default, unchanged
-         from before #683).
+    subprocess always sees it set) -- `git()` below runs with cwd=VAULT_ROOT
+    and the report is written under it too, so a real mismatch is not a
+    cosmetic label, it audits and overwrites the wrong vault's
+    `Meta/Drift Audit.md` with no error otherwise
+    (scripts/check-vault-root-reads.py's SEV-B-cwd bug class). Warning here,
+    naming the ignored VAULT_ROOT, is the actual bug-class fix.
+    compress-vault-doc.py shares this exact resolver but omits this
+    callback, since it has no comparable warning of its own.
     """
-    cwd = Path.cwd()
-    cwd_vault = find_meta_vault_root(collapse_worktree(cwd))
-    env_raw = os.environ.get("VAULT_ROOT")
-
-    if cwd_vault is None:
-        # cwd isn't itself inside an established vault, so there is nothing
-        # here to override -- vault_root_for's own env-fallback (or the cwd
-        # default when even VAULT_ROOT is unset) is exactly the answer.
-        return vault_root_for(cwd) or collapse_worktree(cwd)
-
-    if not env_raw:
-        return cwd_vault
-
-    env_root = collapse_worktree(Path(os.path.expanduser(env_raw)).resolve())
-    if env_root == cwd_vault:
-        return cwd_vault
-    if os.environ.get("VAULT_ROOT_FORCE", "").strip().lower() in ("1", "true", "yes"):
-        return env_root
     print(
         f"WARNING: VAULT_ROOT env points at {env_root}, but the current "
         f"directory resolves to the vault at {cwd_vault}. Auditing "
@@ -130,10 +84,18 @@ def _resolve_vault_root() -> Path:
         f"VAULT_ROOT_FORCE=1 to force {env_root} instead.",
         file=sys.stderr,
     )
-    return cwd_vault
 
 
-VAULT_ROOT = _resolve_vault_root()
+# fallback= is what this CLI is documented (see the module docstring) to
+# default to when NEITHER cwd nor VAULT_ROOT resolves to an established
+# vault at all -- unchanged from before #683. It is the one parameter
+# resolve_cli_vault_root lets callers differ on; every other combination of
+# cwd/VAULT_ROOT/VAULT_ROOT_FORCE resolves identically to whatever
+# compress-vault-doc.py (which shares this same function) would resolve.
+VAULT_ROOT = resolve_cli_vault_root(
+    fallback=collapse_worktree(Path.cwd()),
+    on_mismatch=_warn_vault_root_mismatch,
+)
 
 # Resolve Meta/ folder. Vaults vary: "Meta/", "⚙️ Meta/", "_meta/", etc.
 # Pick the first one that exists; fall back to "Meta/" for new installs.
