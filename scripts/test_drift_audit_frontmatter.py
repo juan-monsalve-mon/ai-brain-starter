@@ -18,6 +18,19 @@ This suite runs the real script against a throwaway git vault and asserts the
 frontmatter it produces round-trips through yaml.safe_load, including for an
 --include value chosen to break naive quoting.
 
+Every case is also parsed with yaml.CSafeLoader when PyYAML is built against
+libyaml (yaml.__with_libyaml__), not only the pure yaml.SafeLoader that
+yaml.safe_load always uses. The two disagree on an astral-plane character
+(one outside the Basic Multilingual Plane, e.g. an emoji): json.dumps's
+default ensure_ascii=True escapes it to a UTF-16 SURROGATE PAIR of two
+separate \\uXXXX sequences. The pure SafeLoader quietly reassembles those into
+a single lone-surrogate Python string (which then blows up the moment
+anything tries to re-encode it as UTF-8); the libyaml-backed CSafeLoader --
+what a production PyYAML install actually runs when libyaml is available --
+raises ScannerError outright on the same input. A suite that only calls
+yaml.safe_load never sees either failure. ensure_ascii=False (this fix) emits
+the real UTF-8 character instead, which both loaders parse as one codepoint.
+
 Run:
   python3 scripts/test_drift_audit_frontmatter.py
   python3 scripts/test_drift_audit_frontmatter.py --verbose
@@ -56,12 +69,17 @@ def git(vault: Path, *args: str) -> None:
 
 
 def build_vault(vault: Path, filename: str = "Note.md", edits: int = 6) -> None:
-    """A git vault with one file edited enough times to land in the audit."""
+    """A git vault with one file edited enough times to land in the audit.
+
+    `filename` may include a subfolder (e.g. the astral-emoji case's
+    "\U0001F4D3 Journals/Note.md") -- its parent is created too.
+    """
     git(vault, "init", "-q")
     git(vault, "config", "user.email", "test@example.com")
     git(vault, "config", "user.name", "Test")
     (vault / "Meta").mkdir(parents=True, exist_ok=True)
     note = vault / filename
+    note.parent.mkdir(parents=True, exist_ok=True)
     for i in range(edits):
         note.write_text(f"# Note\n\nrevision {i}\n", encoding="utf-8")
         git(vault, "add", filename)
@@ -100,7 +118,25 @@ CASES = [
     # single quotes, so this is the shape that a naive single-quoted scalar
     # cannot survive. json.dumps can.
     ("glob with an apostrophe", "Note's.md", "*'s.md"),
+    # An astral-plane character (outside the Basic Multilingual Plane) --
+    # a real vault folder name, not a synthetic edge case. json.dumps's
+    # default ensure_ascii=True escapes this to a UTF-16 surrogate pair that
+    # the pure SafeLoader silently mis-parses and libyaml's CSafeLoader
+    # rejects outright (review F5). ensure_ascii=False fixes both.
+    ("astral emoji glob", "\U0001F4D3 Journals/AstralNote.md", "\U0001F4D3 Journals/*.md"),
 ]
+
+
+# yaml.safe_load() always uses the pure-Python SafeLoader, never the
+# libyaml-backed CSafeLoader even when it's available. A production install
+# with libyaml (the common case: `python3 -c "import yaml; print(yaml.
+# __with_libyaml__)"`) parses frontmatter with CSafeLoader whenever calling
+# code asks for it by name, and the two loaders disagree on a surrogate pair
+# (see the module docstring) -- so both are exercised here, not just the one
+# yaml.safe_load happens to pick.
+_LOADERS = [("SafeLoader", yaml.SafeLoader)]
+if getattr(yaml, "__with_libyaml__", False):
+    _LOADERS.append(("CSafeLoader", yaml.CSafeLoader))
 
 
 def run_case(name: str, filename: str, include: str, verbose: bool) -> bool:
@@ -117,31 +153,46 @@ def run_case(name: str, filename: str, include: str, verbose: bool) -> bool:
             return False
 
         fm = read_frontmatter(out)
-        try:
-            data = yaml.safe_load(fm)
-        except yaml.YAMLError as e:
-            print(f"  FAIL {name}: frontmatter is not valid YAML")
-            print(f"    {str(e).splitlines()[0]}")
-            if verbose:
-                print("    frontmatter was:")
-                for line in fm.strip().splitlines():
-                    print("      " + line)
-            return False
-
-        if not isinstance(data, dict):
-            print(f"  FAIL {name}: frontmatter parsed to {type(data).__name__}, not a mapping")
-            return False
-        for key in ("creationDate", "type", "purpose", "generator"):
-            if key not in data:
-                print(f"  FAIL {name}: frontmatter lost the '{key}' key")
+        parsed = {}
+        for loader_name, loader in _LOADERS:
+            try:
+                # Both loaders in _LOADERS are the SAFE ones (SafeLoader is
+                # what yaml.safe_load calls internally; CSafeLoader is its
+                # libyaml-accelerated equivalent) -- never yaml.Loader or
+                # unsafe_load. Explicit Loader= is required here because
+                # safe_load() hardcodes SafeLoader and cannot select
+                # CSafeLoader at all.
+                parsed[loader_name] = yaml.load(fm, Loader=loader)
+            except yaml.YAMLError as e:
+                print(f"  FAIL {name}: frontmatter is not valid YAML under {loader_name}")
+                print(f"    {str(e).splitlines()[0]}")
+                if verbose:
+                    print("    frontmatter was:")
+                    for line in fm.strip().splitlines():
+                        print("      " + line)
                 return False
-        if include not in str(data["purpose"]):
-            print(f"  FAIL {name}: purpose does not round-trip the --include value")
-            print(f"    got: {data['purpose']!r}")
-            return False
 
+        for loader_name, data in parsed.items():
+            if not isinstance(data, dict):
+                print(f"  FAIL {name}: frontmatter parsed to {type(data).__name__} under {loader_name}, not a mapping")
+                return False
+            for key in ("creationDate", "type", "purpose", "generator"):
+                if key not in data:
+                    print(f"  FAIL {name}: frontmatter lost the '{key}' key under {loader_name}")
+                    return False
+            if include not in str(data["purpose"]):
+                print(f"  FAIL {name}: purpose does not round-trip the --include value under {loader_name}")
+                print(f"    got: {data['purpose']!r}")
+                return False
+            try:
+                str(data["purpose"]).encode("utf-8")
+            except UnicodeEncodeError as e:
+                print(f"  FAIL {name}: purpose parsed under {loader_name} but won't re-encode as UTF-8: {e}")
+                return False
+
+        data = parsed["SafeLoader"]
         if verbose:
-            print(f"    purpose -> {data['purpose']!r}")
+            print(f"    purpose -> {data['purpose']!r}  (checked: {', '.join(parsed)})")
         print(f"  ok   {name}")
         return True
     finally:
