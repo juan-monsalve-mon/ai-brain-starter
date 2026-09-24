@@ -27,6 +27,9 @@ Usage:
 
 Env overrides:
     VAULT_ROOT       Default: current working directory (must be a git repo).
+                     Honored only when it agrees with cwd, when cwd is not
+                     itself a git repo, or when VAULT_ROOT_FORCE=1 -- see
+                     _resolve_vault_root().
     DRIFT_DAYS       Default: 30
     DRIFT_MIN_EDITS  Default: 5
     DRIFT_TOP_N      Default: 30
@@ -45,7 +48,56 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-VAULT_ROOT = Path(os.environ.get("VAULT_ROOT") or os.getcwd())
+
+def _resolve_vault_root() -> Path:
+    """Resolve the vault root: cwd first, VAULT_ROOT as a guarded fallback.
+
+    This CLI is documented (see the module docstring) to default to the
+    current working directory -- it is meant to be run from inside the vault
+    you want audited, the same way you would run a linter from a project
+    root. A naive `os.environ.get("VAULT_ROOT") or os.getcwd()` gets that
+    backwards: VAULT_ROOT is routinely exported machine-wide (a shell
+    profile, or Claude Code's settings.json `env` block, so every hook
+    subprocess always sees it set), which means it ALWAYS wins once set,
+    silently overriding the vault the caller actually cd-ed into and meant
+    to audit -- `git()` below runs with cwd=VAULT_ROOT, and the report is
+    written under VAULT_ROOT too, so the mismatch is not a cosmetic label,
+    it audits and overwrites the wrong vault's `Meta/Drift Audit.md` with no
+    error (scripts/check-vault-root-reads.py's SEV-B-cwd bug class: right
+    often enough to look fine, wrong whenever the tool runs from anywhere
+    else).
+
+    Precedence:
+      1. cwd, when VAULT_ROOT is unset, or set but equal to cwd.
+      2. VAULT_ROOT, when cwd is not a git repo (preserves this script's
+         pre-existing behavior for e.g. running from $HOME with VAULT_ROOT
+         pointed at the vault) or when VAULT_ROOT_FORCE=1 (deliberate
+         cross-vault run).
+      3. Otherwise cwd wins, with a warning naming the ignored VAULT_ROOT --
+         the actual bug-class fix: a real mismatch no longer resolves
+         silently to the wrong vault.
+    """
+    cwd = Path.cwd()
+    env_raw = os.environ.get("VAULT_ROOT")
+    if not env_raw:
+        return cwd
+    env_root = Path(os.path.expanduser(env_raw)).resolve()
+    if env_root == cwd.resolve():
+        return env_root
+    if os.environ.get("VAULT_ROOT_FORCE", "").strip().lower() in ("1", "true", "yes"):
+        return env_root
+    if not (cwd / ".git").exists() and (env_root / ".git").exists():
+        return env_root
+    print(
+        f"WARNING: VAULT_ROOT env points at {env_root}, but the current "
+        f"directory is {cwd}. Auditing {cwd} (where you actually ran this "
+        f"from); set VAULT_ROOT_FORCE=1 to force {env_root} instead.",
+        file=sys.stderr,
+    )
+    return cwd
+
+
+VAULT_ROOT = _resolve_vault_root()
 
 # Resolve Meta/ folder. Vaults vary: "Meta/", "⚙️ Meta/", "_meta/", etc.
 # Pick the first one that exists; fall back to "Meta/" for new installs.
