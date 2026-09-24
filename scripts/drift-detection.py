@@ -27,9 +27,9 @@ Usage:
 
 Env overrides:
     VAULT_ROOT       Default: current working directory (must be a git repo).
-                     Honored only when it agrees with cwd, when cwd is not
-                     itself a git repo, or when VAULT_ROOT_FORCE=1 -- see
-                     _resolve_vault_root().
+                     Honored only when cwd is not itself inside an established
+                     vault, when it agrees with the vault cwd resolves to, or
+                     when VAULT_ROOT_FORCE=1 -- see _resolve_vault_root().
     DRIFT_DAYS       Default: 30
     DRIFT_MIN_EDITS  Default: 5
     DRIFT_TOP_N      Default: 30
@@ -48,16 +48,30 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
+# Reach for the repo's canonical per-target vault-root semantics
+# (hooks/_lib/vault_root.py) instead of re-deriving cwd-vs-VAULT_ROOT
+# precedence a second time -- the same two-line sys.path trick
+# scripts/build-journal-index.py already uses for hooks/_lib/safe_read.py.
+# The first entry resolves `_lib` when this file is a synced vault copy at
+# <meta>/scripts/drift-detection.py (sync-vault-scripts.sh mirrors
+# hooks/_lib/vault_root.py to <meta>/scripts/_lib/ for exactly this case);
+# the second resolves it when this file is the repo checkout's own
+# scripts/drift-detection.py, sitting next to hooks/_lib/ two levels up.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
+from _lib.vault_root import collapse_worktree, find_meta_vault_root, vault_root_for  # noqa: E402
+
 
 def _resolve_vault_root() -> Path:
-    """Resolve the vault root: cwd first, VAULT_ROOT as a guarded fallback.
+    """Resolve the vault root: the vault cwd is actually inside, VAULT_ROOT
+    as a guarded fallback.
 
     This CLI is documented (see the module docstring) to default to the
     current working directory -- it is meant to be run from inside the vault
     you want audited, the same way you would run a linter from a project
     root. A naive `os.environ.get("VAULT_ROOT") or os.getcwd()` gets that
     backwards: VAULT_ROOT is routinely exported machine-wide (a shell
-    profile, or Claude Code's settings.json `env` block, so every hook
+    profile, or a Claude Code settings.json `env` block, so every hook
     subprocess always sees it set), which means it ALWAYS wins once set,
     silently overriding the vault the caller actually cd-ed into and meant
     to audit -- `git()` below runs with cwd=VAULT_ROOT, and the report is
@@ -67,34 +81,56 @@ def _resolve_vault_root() -> Path:
     often enough to look fine, wrong whenever the tool runs from anywhere
     else).
 
+    A first pass at this fix (#683) treated "cwd is SOME git repo" as "cwd is
+    a vault", which got two cases backwards: cwd inside a plain code
+    checkout (no Meta folder at all) still beat a real VAULT_ROOT and wrote
+    into <coderepo>/Meta, and cwd inside a vault's OWN `.claude/worktrees/`
+    checkout was treated as a second, separate vault instead of collapsing
+    to the main one. "Cwd is a vault" now means what
+    hooks/_lib/vault_root.py's find_meta_vault_root() means: an ancestor of
+    cwd (worktree-collapsed) already has a Meta-suffixed folder -- not
+    merely that cwd happens to sit inside some git repository.
+
     Precedence:
-      1. cwd, when VAULT_ROOT is unset, or set but equal to cwd.
-      2. VAULT_ROOT, when cwd is not a git repo (preserves this script's
-         pre-existing behavior for e.g. running from $HOME with VAULT_ROOT
-         pointed at the vault) or when VAULT_ROOT_FORCE=1 (deliberate
-         cross-vault run).
-      3. Otherwise cwd wins, with a warning naming the ignored VAULT_ROOT --
-         the actual bug-class fix: a real mismatch no longer resolves
-         silently to the wrong vault.
+      1. cwd (worktree-collapsed), when it resolves to an already-established
+         vault (an ancestor with a Meta-suffixed folder) and VAULT_ROOT is
+         unset, or set but equal to that vault.
+      2. VAULT_ROOT (worktree-collapsed), when cwd does NOT resolve to an
+         established vault at all -- there is nothing here to override --
+         or when VAULT_ROOT_FORCE=1 (deliberate cross-vault run).
+      3. Otherwise the vault cwd resolves to wins, with a warning naming the
+         ignored VAULT_ROOT -- the actual bug-class fix: a real mismatch no
+         longer resolves silently to the wrong vault.
+      4. cwd itself (worktree-collapsed), when NEITHER cwd nor VAULT_ROOT
+         resolves to an established vault (new-install default, unchanged
+         from before #683).
     """
     cwd = Path.cwd()
+    cwd_vault = find_meta_vault_root(collapse_worktree(cwd))
     env_raw = os.environ.get("VAULT_ROOT")
+
+    if cwd_vault is None:
+        # cwd isn't itself inside an established vault, so there is nothing
+        # here to override -- vault_root_for's own env-fallback (or the cwd
+        # default when even VAULT_ROOT is unset) is exactly the answer.
+        return vault_root_for(cwd) or collapse_worktree(cwd)
+
     if not env_raw:
-        return cwd
-    env_root = Path(os.path.expanduser(env_raw)).resolve()
-    if env_root == cwd.resolve():
-        return env_root
+        return cwd_vault
+
+    env_root = collapse_worktree(Path(os.path.expanduser(env_raw)).resolve())
+    if env_root == cwd_vault:
+        return cwd_vault
     if os.environ.get("VAULT_ROOT_FORCE", "").strip().lower() in ("1", "true", "yes"):
-        return env_root
-    if not (cwd / ".git").exists() and (env_root / ".git").exists():
         return env_root
     print(
         f"WARNING: VAULT_ROOT env points at {env_root}, but the current "
-        f"directory is {cwd}. Auditing {cwd} (where you actually ran this "
-        f"from); set VAULT_ROOT_FORCE=1 to force {env_root} instead.",
+        f"directory resolves to the vault at {cwd_vault}. Auditing "
+        f"{cwd_vault} (where you actually ran this from); set "
+        f"VAULT_ROOT_FORCE=1 to force {env_root} instead.",
         file=sys.stderr,
     )
-    return cwd
+    return cwd_vault
 
 
 VAULT_ROOT = _resolve_vault_root()
@@ -254,7 +290,19 @@ def main():
     args = parser.parse_args()
 
     if not (VAULT_ROOT / ".git").exists():
-        print(f"No .git at {VAULT_ROOT}. Set VAULT_ROOT to a git-tracked vault.", file=sys.stderr)
+        # vault-root-ok: message-only read to phrase this error -- VAULT_ROOT
+        # itself was already resolved through _resolve_vault_root() above;
+        # this only decides whether to say "already set (to ...)" or "Set".
+        env_raw = os.environ.get("VAULT_ROOT")
+        if env_raw:
+            print(
+                f"No .git at {VAULT_ROOT}. VAULT_ROOT is already set (to "
+                f"{env_raw!r}) -- point it at a git-tracked vault, or run "
+                f"this from inside one.",
+                file=sys.stderr,
+            )
+        else:
+            print(f"No .git at {VAULT_ROOT}. Set VAULT_ROOT to a git-tracked vault, or run this from inside one.", file=sys.stderr)
         return 2
 
     log = git([
@@ -346,7 +394,18 @@ def main():
     # The purpose line carries both ": " and "'". An unquoted YAML scalar
     # containing ": " parses as a nested mapping, so the generated file's
     # frontmatter failed yaml.safe_load. json.dumps emits a double-quoted
-    # scalar, which is valid YAML and survives any --include value.
+    # scalar, which is valid YAML -- but json.dumps's OWN default
+    # (ensure_ascii=True) escapes any non-ASCII character to a \uXXXX
+    # sequence, and for an astral-plane codepoint (an emoji vault folder
+    # name like "📓 Journals", a real --include glob) that means a SURROGATE
+    # PAIR: two \uXXXX escapes neither YAML loader treats as one character.
+    # The pure-Python SafeLoader silently reassembles them into a lone
+    # surrogate (fails to re-encode as UTF-8 the moment anything downstream
+    # tries), and the libyaml-backed CSafeLoader -- what a production PyYAML
+    # install actually runs when available -- raises ScannerError outright.
+    # ensure_ascii=False writes the real UTF-8 character instead, which both
+    # loaders parse as one codepoint. See test_drift_audit_frontmatter.py's
+    # astral-emoji case.
     purpose = (
         f"Multi-edit drift audit. Files edited {args.min_edits}+ times "
         f"in last {args.days} days. Include: '{args.include}'."
@@ -356,7 +415,7 @@ def main():
         "---",
         f"creationDate: {today}",
         "type: meta",
-        f"purpose: {json.dumps(purpose)}",
+        f"purpose: {json.dumps(purpose, ensure_ascii=False)}",
         "generator: scripts/drift-detection.py",
         "---",
         "",

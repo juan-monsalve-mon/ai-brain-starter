@@ -55,7 +55,56 @@ import sys
 from pathlib import Path
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
-VAULT_ROOT = Path(os.environ.get("VAULT_ROOT", str(_SCRIPT_DIR.parent)))
+
+# Same two-line sys.path trick scripts/drift-detection.py and
+# scripts/build-journal-index.py use to reach hooks/_lib/ from either a repo
+# checkout or a synced vault copy (see sync-vault-scripts.sh's VAULT_LIB_MODULES).
+sys.path.insert(0, str(_SCRIPT_DIR))
+sys.path.insert(0, str(_SCRIPT_DIR.parent / "hooks"))
+from _lib.vault_root import collapse_worktree, find_meta_vault_root, vault_root_for  # noqa: E402
+
+
+def _resolve_vault_root() -> Path:
+    """Resolve the vault root with the SAME precedence as
+    scripts/drift-detection.py's _resolve_vault_root() (#683 F3): cwd, when
+    it resolves to an already-established vault (an ancestor with a
+    Meta-suffixed folder, worktree-collapsed); VAULT_ROOT as a guarded
+    fallback otherwise, honoring VAULT_ROOT_FORCE=1 on a genuine mismatch.
+
+    This script is the CONSUMER of what drift-detection.py's `--auto-from-
+    drift` PRODUCES (`Meta/Drift Audit.md`). Before this fix each script read
+    VAULT_ROOT independently -- this one naively -- so a cwd/VAULT_ROOT
+    combination that drift-detection.py resolved to one vault could have this
+    script looking for its output in another, reporting a false "Drift Audit
+    not found" with no hint that the producer wrote the file somewhere else.
+    Sharing the precedence (not just the env var) is what makes them agree.
+
+    Falls back to this script's own pre-existing default (its parent
+    directory) only when NEITHER cwd nor VAULT_ROOT resolves to an
+    established vault at all -- the one case where there is no vault for the
+    two scripts to agree on, and the case this script's default already
+    covered before #683.
+    """
+    cwd = Path.cwd()
+    cwd_vault = find_meta_vault_root(collapse_worktree(cwd))
+    env_raw = os.environ.get("VAULT_ROOT")
+
+    if cwd_vault is None:
+        found = vault_root_for(cwd)
+        return found if found is not None else collapse_worktree(_SCRIPT_DIR.parent)
+
+    if not env_raw:
+        return cwd_vault
+
+    env_root = collapse_worktree(Path(os.path.expanduser(env_raw)).resolve())
+    if env_root == cwd_vault:
+        return cwd_vault
+    if os.environ.get("VAULT_ROOT_FORCE", "").strip().lower() in ("1", "true", "yes"):
+        return env_root
+    return cwd_vault
+
+
+VAULT_ROOT = _resolve_vault_root()
 
 
 # ─── Regex patterns (run in order) ──────────────────────────────────────
