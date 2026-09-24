@@ -9,15 +9,27 @@ description: What's new in AI Brain Starter — plain English, no jargon
 
 ---
 
+## 2026-09-23: the Decision Log index stops listing decisions as "????-??-?? — What"
+
+**Who this affects:** anyone whose decision files have `creationDate` but no `decision_date`, or use a What/Why template with `## What` (or `## Qué`) as the first heading. Session-close writes plenty of both.
+
+The index at the top of `Decision Log.md` took the date from `decision_date` only and the title from the first heading in the file. On one 102-decision vault, 16 entries showed up as `????-??-??`, and 12 of those had the same title, "Qué". An index where a dozen rows read the same thing is no help for finding a decision.
+
+It wasn't only cosmetic. A decision with no date stays in the main log forever, so closed decisions without `decision_date` could never move to `Decision Log Archive.md`.
+
+Now, when `decision_date` is missing, the date comes from `creationDate`, and failing that from the date at the start of the filename. Headings that are just template labels (What, Why, Context, Qué, Por qué, Contexto…) are skipped. When nothing else is left, the title is the first sentence of the What section, stripped of bold and links and cut at about 90 characters. Decision files are not touched. The fix is entirely in how the index is built.
+
+---
+
 ## 2026-09-20: the generated Drift Audit frontmatter did not parse as YAML, and the script could silently audit the wrong vault
 
-**Who this affects:** anyone running `drift-detection.py`, and anyone with `VAULT_ROOT` exported machine-wide (Claude Code's `settings.json` `env` block does this by default) who runs it from a vault other than the one `VAULT_ROOT` names.
+**Who this affects:** anyone running `drift-detection.py`, and anyone with `VAULT_ROOT` exported machine-wide (a shell profile, or a Claude Code `settings.json` `env` block someone configured) who runs it from a vault other than the one `VAULT_ROOT` names.
 
-**Bug 1 — the frontmatter it wrote couldn't be parsed.** The generated `Meta/Drift Audit.md` carries a `purpose:` line built from the `--include` glob, e.g. `purpose: Multi-edit drift audit. ... Include: '*.md'.`. An unquoted YAML scalar containing `": "` is read as a nested mapping, so `yaml.safe_load` raised "mapping values are not allowed here" — the file was invisible to Dataview, metadata extractors, and any other frontmatter-reading tool, with nothing erroring to say so. The purpose line is now JSON-encoded (`json.dumps`), which is valid YAML and survives any `--include` value, including one with an apostrophe in it.
+**Bug 1 — the frontmatter it wrote couldn't be parsed.** The generated `Meta/Drift Audit.md` carries a `purpose:` line built from the `--include` glob, e.g. `purpose: Multi-edit drift audit. ... Include: '*.md'.`. An unquoted YAML scalar containing `": "` is read as a nested mapping, so `yaml.safe_load` raised "mapping values are not allowed here" — the file was invisible to Dataview, metadata extractors, and any other frontmatter-reading tool, with nothing erroring to say so. The purpose line is now JSON-encoded (`json.dumps(..., ensure_ascii=False)`), which is valid YAML for every glob we tested, including one with an apostrophe or an astral-plane emoji (a real vault folder name, e.g. "📓 Journals") in it.
 
-**Bug 2 — a globally-exported `VAULT_ROOT` silently outranked the vault you were standing in.** The script read `os.environ.get("VAULT_ROOT") or os.getcwd()`: once `VAULT_ROOT` is set anywhere (a shell profile, or Claude Code's `env` block, which every hook subprocess inherits), it always wins, even when you `cd` into a different git-tracked vault and run the script there. Both the git history it scans and the `Meta/Drift Audit.md` it writes would resolve against the wrong vault, with no error. It now prefers the current directory, and only falls back to `VAULT_ROOT` when the current directory isn't a git repo, when the two already agree, or when you set `VAULT_ROOT_FORCE=1` — otherwise it warns and audits the directory you actually ran it from.
+**Bug 2 — a globally-exported `VAULT_ROOT` silently outranked the vault you were standing in.** The script read `os.environ.get("VAULT_ROOT") or os.getcwd()`: once `VAULT_ROOT` is set anywhere (a shell profile, or Claude Code's `env` block, which every hook subprocess inherits), it always wins, even when you `cd` into a different git-tracked vault and run the script there. Both the git history it scans and the `Meta/Drift Audit.md` it writes would resolve against the wrong vault, with no error. It now prefers the vault you're actually standing in — cwd, or an ancestor of cwd that already has a Meta folder, collapsing a vault worktree to its main vault first — and only falls back to `VAULT_ROOT` when cwd isn't inside an established vault at all (a plain code checkout, say), when the two already agree, or when you set `VAULT_ROOT_FORCE=1` — otherwise it warns and audits the vault you actually ran it from. `compress-vault-doc.py` resolves the vault the same way, so it can always find what `drift-detection.py` just wrote.
 
-Bug 2 surfaced while landing the fix for Bug 1, not from a user report — both ship together, with a regression test for each.
+Bug 2 surfaced while landing the fix for Bug 1, not from a user report — both ship together, with a regression test for each. Both bugs, and this second hardening pass on Bug 2's own fix (the worktree and non-vault-checkout cases), came from @juan-monsalve-mon's #683 plus an independent adversarial review of that PR before it landed.
 
 ---
 
