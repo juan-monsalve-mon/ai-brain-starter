@@ -17,14 +17,24 @@ SEV-B-cwd bug class).
 This suite runs the real script as a subprocess against two throwaway git
 vaults -- one as cwd, one as $VAULT_ROOT -- and asserts:
 
-  1. mismatch (both are git repos, neither forced): the script audits cwd,
-     not $VAULT_ROOT, and warns on stderr.
+  1. mismatch (both are established vaults, neither forced): the script
+     audits cwd, not $VAULT_ROOT, and warns on stderr.
   2. VAULT_ROOT_FORCE=1: the script audits $VAULT_ROOT, matching the
      pre-existing (deliberate override) behavior.
   3. cwd is NOT a git repo but $VAULT_ROOT is: the script falls back to
      $VAULT_ROOT with no warning -- the pre-existing behavior for this case
      is unchanged.
   4. $VAULT_ROOT unset: the script uses cwd (today's documented default).
+  5. cwd is a git repo but NOT a vault (no Meta folder anywhere above it) --
+     a plain code checkout: $VAULT_ROOT wins, no warning. "cwd is a vault"
+     means an ancestor with a Meta-suffixed folder, not merely "cwd is some
+     git repo" -- the distinction the first fix on this branch got backwards
+     (#683 review, F2).
+  6. cwd is inside a vault's own .claude/worktrees/<slug> checkout: resolves
+     to the MAIN vault, not the worktree (F2).
+  7. cwd is a plain subfolder of a vault (no .git of its own): resolves to
+     the vault by walking up to the Meta folder, VAULT_ROOT unset or not
+     (F6).
 
 Run:
   python3 scripts/test_drift_detection_vault_root.py
@@ -58,16 +68,36 @@ def git(vault: Path, *args: str) -> None:
 
 
 def build_vault(vault: Path, filename: str = "Note.md", edits: int = 6) -> None:
-    """A git vault with one file edited enough times to land in the audit."""
+    """A git vault with one file edited enough times to land in the audit.
+
+    Always creates a Meta folder: "cwd is a vault" now means "an ancestor of
+    cwd has a Meta-suffixed folder" (hooks/_lib/vault_root.py's
+    find_meta_vault_root), not merely "cwd is some git repo" -- a fixture
+    with no Meta folder can no longer tell a vault from a plain code
+    checkout, which is exactly the distinction case_code_repo_cwd_is_not_a_
+    vault below depends on.
+    """
     vault.mkdir(parents=True, exist_ok=True)
     git(vault, "init", "-q")
     git(vault, "config", "user.email", "test@example.com")
     git(vault, "config", "user.name", "Test")
+    (vault / "Meta").mkdir(parents=True, exist_ok=True)
     note = vault / filename
     for i in range(edits):
         note.write_text(f"# Note\n\nrevision {i}\n", encoding="utf-8")
         git(vault, "add", filename)
         git(vault, "commit", "-q", "-m", f"edit {i}")
+
+
+def build_code_repo(repo: Path, filename: str = "README.md") -> None:
+    """A git repo with NO Meta folder -- a plain code checkout, not a vault."""
+    repo.mkdir(parents=True, exist_ok=True)
+    git(repo, "init", "-q")
+    git(repo, "config", "user.email", "test@example.com")
+    git(repo, "config", "user.name", "Test")
+    (repo / filename).write_text("code\n", encoding="utf-8")
+    git(repo, "add", filename)
+    git(repo, "commit", "-q", "-m", "init")
 
 
 def run_script(cwd: Path, extra_env: dict) -> subprocess.CompletedProcess:
@@ -198,11 +228,100 @@ def case_unset_uses_cwd(verbose: bool) -> bool:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def case_code_repo_cwd_is_not_a_vault(verbose: bool) -> bool:
+    """cwd is SOME git repo, but not a vault (no Meta folder anywhere above
+    it) -- VAULT_ROOT wins, with no warning, because there is no vault at
+    cwd for VAULT_ROOT to override. Before #683's own fix, "cwd is a git
+    repo" alone made cwd win here, sending the audit into <coderepo>/Meta.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="drift-vaultroot-test-"))
+    try:
+        code_repo = tmp / "code-repo"
+        env_vault = tmp / "env-vault"
+        build_code_repo(code_repo)
+        build_vault(env_vault, "EnvNote.md")
+
+        proc = run_script(code_repo, {"VAULT_ROOT": str(env_vault)})
+        env_report = env_vault / "Meta" / "Drift Audit.md"
+        code_repo_report = code_repo / "Meta" / "Drift Audit.md"
+        ok = check(
+            "code repo cwd (not a vault): VAULT_ROOT wins",
+            env_report.exists() and not code_repo_report.exists(),
+            f"env_report exists={env_report.exists()} code_repo_report exists={code_repo_report.exists()} stderr={proc.stderr.strip()[:200]!r}",
+            verbose,
+        )
+        ok &= check(
+            "code repo cwd: no spurious mismatch warning",
+            "WARNING: VAULT_ROOT" not in proc.stderr,
+            f"stderr: {proc.stderr.strip()[:200]!r}",
+            verbose,
+        )
+        return ok
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def case_worktree_cwd_resolves_to_main_vault(verbose: bool) -> bool:
+    """cwd inside a vault's own .claude/worktrees/<slug> checkout resolves to
+    the MAIN vault, not the worktree -- a worktree carries a full copy of
+    the tree, Meta folder included, so an unqualified walk-up would stop at
+    the worktree and strand the audit there instead of collapsing to the
+    vault it is a worktree OF.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="drift-vaultroot-test-"))
+    try:
+        vault = tmp / "vault"
+        build_vault(vault, "MainNote.md")
+        worktree = vault / ".claude" / "worktrees" / "wt1"
+        git(vault, "worktree", "add", "-q", str(worktree), "-b", "wt1")
+
+        proc = run_script(worktree, {})
+        main_report = vault / "Meta" / "Drift Audit.md"
+        worktree_report = worktree / "Meta" / "Drift Audit.md"
+        return check(
+            "vault worktree cwd resolves to the main vault",
+            main_report.exists() and not worktree_report.exists(),
+            f"main_report exists={main_report.exists()} worktree_report exists={worktree_report.exists()} stderr={proc.stderr.strip()[:200]!r}",
+            verbose,
+        )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def case_subfolder_cwd_resolves_to_vault(verbose: bool) -> bool:
+    """cwd in a plain subfolder of the vault (no .git of its own) resolves
+    to the vault, by walking up to the ancestor that has the Meta folder --
+    not by the old "does cwd itself have a .git" check, which a subfolder
+    always fails regardless of VAULT_ROOT.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="drift-vaultroot-test-"))
+    try:
+        vault = tmp / "vault"
+        build_vault(vault, "SubNote.md")
+        sub = vault / "sub"
+        sub.mkdir(parents=True)
+
+        proc = run_script(sub, {})
+        vault_report = vault / "Meta" / "Drift Audit.md"
+        sub_report = sub / "Meta" / "Drift Audit.md"
+        return check(
+            "vault subfolder cwd resolves to the vault",
+            vault_report.exists() and not sub_report.exists(),
+            f"vault_report exists={vault_report.exists()} sub_report exists={sub_report.exists()} stderr={proc.stderr.strip()[:200]!r}",
+            verbose,
+        )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 CASES = [
     ("mismatch prefers cwd", case_mismatch_prefers_cwd),
     ("VAULT_ROOT_FORCE=1 prefers VAULT_ROOT", case_force_prefers_vault_root),
     ("non-git cwd falls back to VAULT_ROOT", case_non_git_cwd_falls_back),
     ("VAULT_ROOT unset uses cwd", case_unset_uses_cwd),
+    ("code repo cwd is not a vault", case_code_repo_cwd_is_not_a_vault),
+    ("vault worktree cwd resolves to main vault", case_worktree_cwd_resolves_to_main_vault),
+    ("vault subfolder cwd resolves to vault", case_subfolder_cwd_resolves_to_vault),
 ]
 
 
