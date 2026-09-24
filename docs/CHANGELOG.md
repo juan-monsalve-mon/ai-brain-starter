@@ -9,6 +9,38 @@ description: What's new in AI Brain Starter — plain English, no jargon
 
 ---
 
+## 2026-09-17: graphify's self-link guard missed accented filenames, and skipped files were invisible
+
+**Who this affects:** anyone running `graphify_apply_wikilinks.py` on a vault with accented filenames, notes that share a name across folders, or notes near the 1 MB read cap.
+
+**Bug 1 — the self-link guard didn't survive a Unicode round-trip.** The guard that stops a note linking to itself compared `md.stem.casefold() == link_target.casefold()`. `casefold()` normalizes case, not Unicode composition, so an NFD-decomposed filename (common on macOS/HFS+ — an accented letter stored as a base letter plus a combining mark) never matched an NFC-composed link target, even though the two render identically. An adversarial review found real NFD-decomposed filenames in a live vault and confirmed the script would insert a self-referential `[[wikilink]]` into a note about itself. Both sides now go through a small `_norm()` helper (`unicodedata.normalize("NFC", s).casefold()`) before comparing.
+
+**Bug 2 — the same guard skipped silently, even under `--dry-run`.** When two notes share a stem in different folders (say `Team/Acme.md` and `Archive/Acme.md`), the guard correctly treats both as "the entity's own page" and skips them, but said nothing. The skip was indistinguishable from "no match found" — a legitimate mention could vanish with zero signal, even in dry-run mode. Every self-link skip now prints the vault-relative path and why. The same guard was missing from `find_contexts()` entirely — the function that gathers preview snippets for the approval prompt — so an entity's own note could fill every preview slot with self-references before a real external mention was ever reached.
+
+**Bug 3 — an unreadable or oversized file vanished without a trace.** Three call sites (`collect_mentions()`, `find_contexts()`, `apply_wikilink()`) read every note through the shared `safe_read_text()` primitive and just `continue`d past anything that failed: a file over the 1 MB cap, mid-write, or otherwise unreadable. Nothing printed, nothing counted. `build-journal-index.py` already solved this exact problem — accumulate `skipped.append((relpath, status))` and print `"  note: skipped N unreadable file(s): <preview>"` once at the end. All three call sites now follow that pattern.
+
+**Bug 4 — `load_report()`'s own error handling couldn't fire.** `load_report()` already prints a warning when its read fails, but it read the gap report with `errors="ignore"`, so a malformed byte was silently dropped and the file parsed as if it were clean — the warning path existed but nothing could ever reach it. Restored to strict decoding (the behavior before this PR); the other three call sites keep `errors="ignore"`, since that was already their behavior before this PR and isn't a regression.
+
+All four came out of an adversarial review of this PR before merge, not a user report — the fixes ship in the same PR, verified against a synthetic vault built specifically to reproduce each one.
+
+---
+
+## 2026-09-16: asking about a close phrase no longer closes the session
+
+**Who this affects:** anyone who set their own `closingSignals.custom` phrases in CLAUDE.md — and, if you write in Spanish, anyone at all.
+
+Your custom close phrases are the highest authority in the detector: they fire no matter what, and they deliberately skip the false-positive guards. That is the right call for a phrase you chose yourself — until you need to *talk about* it.
+
+Quote one of your own phrases and the session closed. Testing the detector, reporting a false positive, asking to add a phrase to the list, pasting a config line — all of them ended the session mid-task. It happened live while someone was asking to test the very phrase that closed the session on them.
+
+This is the same shape as the relayed-speech fix from #661, one tier up. There the close phrase was content addressed to a third party (`dile a Ana que ya quedó`). Here it is content wrapped in quotes. Both times the phrase is what the message is *about*, not what the message *does*.
+
+The guard that was supposed to catch this only knew four phrases: `chao`, `bye`, `listo`, and two ways to say "close the session". Your own phrases were invisible to it, because a shared language pack cannot know what you put in your CLAUDE.md.
+
+The detector treats quoted spans with real text around them as content, whatever the phrase happens to be. A separate, unquoted close command still works in the same message, even when a filename elsewhere is quoted. A bare quoted phrase with nothing around it still closes the session — someone typing `"chao"` is saying goodbye, not quoting.
+
+---
+
 ## 2026-09-16: "es todo por hoy" now closes the session in Spanish
 
 **Who this affects:** Spanish speakers, especially in Colombia and Mexico.
@@ -72,6 +104,17 @@ So the map has been re-probed against actual `/v1/chat/completions` calls and no
 **The honest caveat, now written into both files:** these IDs were verified on one free-tier account on 2026-09-09. If yours differ, probe a completion — do not trust the catalog, and do not trust this map to still be current.
 
 One practical note that cost an hour: the default's **first call after an idle spell takes 10–15 seconds** (cold start), then settles to about 1.5s. A 60-second timeout is not generous, it is barely enough. Do not read a slow first call as a dead model.
+
+---
+
+## 2026-09-04: wikilinks stop pointing at generated files and at themselves
+
+**Who this affects:** anyone who runs `/graphify` and lets it apply wikilinks.
+
+Two links were being written that no one would write by hand:
+
+- **Links into graphify's own output.** The pass walked `graphify-out/`, so it edited `GRAPH_REPORT.md` and `WIKILINK_GAPS.md` — files the next run overwrites anyway — and left the gap report linking its own table rows.
+- **Notes linking to themselves.** A note whose title matched the link target got a link back to the page you are already reading, and a self-loop in the graph.
 
 ---
 
