@@ -131,4 +131,30 @@ fi
 echo "$HOOK_OUT" | grep -q '"continue":true' || fail "case 3c: expected silent passthrough, got: $HOOK_OUT"
 echo "OK: PRIMARY_PATTERN override replaces the default pattern rather than extending it"
 
+# --- 4. GNU stat semantics: routing still fires with an age note -----------
+# On Linux, `stat -f` means --file-system: `stat -f %m FILE` exits 0 and prints
+# non-numeric text. The hook used to try it first and did arithmetic on that
+# text, so it died silently on every Linux prompt that matched an existing
+# graph (CI caught it on ubuntu; macOS never sees it). A PATH shim with GNU's
+# behaviour for the two forms the hook uses reproduces that on any host.
+# Mutation that turns this red: put `stat -f %m` back first in freshness_note.
+SHIM="$TMP/gnu-stat"
+mkdir -p "$SHIM"
+cat > "$SHIM/stat" <<'SH'
+#!/bin/sh
+case "$1" in
+  -f) printf '  File: "%s"\n    ID: 0 Namelen: 255 Type: ext2/ext3\n' "$3"; exit 0 ;;
+  -c) python3 -c 'import os, sys; print(int(os.path.getmtime(sys.argv[1])))' "$3" ;;
+  *) exit 1 ;;
+esac
+SH
+chmod +x "$SHIM/stat"
+call_hook "journal" VAULT_ROOT="$VAULT" SECONDARY_GRAPH="" PATH="$SHIM:$PATH"
+[[ "$HOOK_RC" -eq 0 ]] || fail "case 4: hook exited $HOOK_RC under GNU stat semantics (stderr: $(cat "$TMP/stderr"))"
+echo "$HOOK_OUT" | grep -q "keyword match: primary scope" ||
+  fail "case 4: primary routing did not fire under GNU stat semantics (output: $HOOK_OUT)"
+echo "$HOOK_OUT" | grep -q "updated 0 day(s) ago" ||
+  fail "case 4: expected a numeric age note under GNU stat semantics (output: $HOOK_OUT)"
+echo "OK: under GNU stat semantics the hook still routes and reports a numeric age"
+
 echo "PASS: test_graph_context_hook_env"

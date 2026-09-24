@@ -139,8 +139,14 @@ freshness_note() {
     return
   fi
   local mtime now days
-  # Try macOS first, fall back to Linux
-  mtime=$(stat -f %m "$path" 2>/dev/null || stat -c %Y "$path" 2>/dev/null || echo 0)
+  # GNU first, then BSD, validating each result (scripts/PORTABILITY.md §1).
+  # GNU `stat -f` means --file-system, so `stat -f %m` on Linux exits 0 with
+  # non-numeric text. The old BSD-first `||` chain passed that text to the
+  # arithmetic below, and the hook died silently on Linux whenever a prompt
+  # matched a graph that exists.
+  mtime=$(stat -c %Y "$path" 2>/dev/null)
+  case "$mtime" in ''|*[!0-9]*) mtime=$(stat -f %m "$path" 2>/dev/null) ;; esac
+  case "$mtime" in ''|*[!0-9]*) printf "age unknown"; return ;; esac
   now=$(date +%s)
   days=$(( (now - mtime) / 86400 ))
   if [ "$days" -gt "$STALE_DAYS" ]; then

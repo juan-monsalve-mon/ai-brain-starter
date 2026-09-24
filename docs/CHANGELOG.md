@@ -9,6 +9,16 @@ description: What's new in AI Brain Starter — plain English, no jargon
 
 ---
 
+## 2026-09-24: graph routing never fired on Linux
+
+**Who this affects:** anyone running `graph-context-hook.sh` on Linux, or anywhere `stat` is the GNU version, with a graph that exists.
+
+The hook reads the graph file's age to warn when it is stale. It asked `stat -f %m` first, which is the macOS form. On Linux `stat -f` means "file system", so it printed text and still reported success, and the hook then crashed on that text and printed nothing. Routing silently never happened there.
+
+Now it asks the Linux form first, then the macOS form, checks that the answer is a number, and says "age unknown" instead of crashing if neither works. The test added with the graph-routing env overrides (#682) caught this the first time it ran on a Linux machine.
+
+---
+
 ## 2026-09-23: the Decision Log index stops listing decisions as "????-??-?? — What"
 
 **Who this affects:** anyone whose decision files have `creationDate` but no `decision_date`, or use a What/Why template with `## What` (or `## Qué`) as the first heading. Session-close writes plenty of both.
