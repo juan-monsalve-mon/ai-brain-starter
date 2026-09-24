@@ -29,7 +29,8 @@ Env overrides:
     VAULT_ROOT       Default: current working directory (must be a git repo).
                      Honored only when cwd is not itself inside an established
                      vault, when it agrees with the vault cwd resolves to, or
-                     when VAULT_ROOT_FORCE=1 -- see _resolve_vault_root().
+                     when VAULT_ROOT_FORCE=1 -- see
+                     hooks/_lib/vault_root.py's resolve_cli_vault_root().
     DRIFT_DAYS       Default: 30
     DRIFT_MIN_EDITS  Default: 5
     DRIFT_TOP_N      Default: 30
@@ -253,7 +254,7 @@ def main():
 
     if not (VAULT_ROOT / ".git").exists():
         # vault-root-ok: message-only read to phrase this error -- VAULT_ROOT
-        # itself was already resolved through _resolve_vault_root() above;
+        # itself was already resolved through resolve_cli_vault_root() above;
         # this only decides whether to say "already set (to ...)" or "Set".
         env_raw = os.environ.get("VAULT_ROOT")
         if env_raw:
